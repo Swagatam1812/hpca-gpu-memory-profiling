@@ -96,13 +96,56 @@ void conv2d_baseline(const float* input, const float* kernel, float* output,
 //
 // =============================================================================
 
+__global__ void kernel_conv2d_variant_1(const float* __restrict__ input_images,
+                                       const float* __restrict__ kernel,
+                                       float* __restrict__ output_images,
+                                       int batch_size, int height, int width,
+                                       int kernel_size) {
+    int batch_index = blockIdx.z;
+    // Correct mapping for coalesced memory access:
+    int row = blockIdx.y * blockDim.y + threadIdx.y;  
+    int col = blockIdx.x * blockDim.x + threadIdx.x;  // contiguous allocation
+
+    if (batch_index >= batch_size || row >= height || col >= width) {
+        return;
+    }
+
+    int radius = (kernel_size - 1) / 2;
+    float accumulated_value = 0.0f;
+
+    for (int kernel_row = 0; kernel_row < kernel_size; ++kernel_row) {
+        int input_row = row + kernel_row - radius;
+        if (input_row < 0 || input_row >= height) continue;
+
+        for (int kernel_col = 0; kernel_col < kernel_size; ++kernel_col) {
+            int input_col = col + kernel_col - radius;
+            if (input_col < 0 || input_col >= width) continue;
+
+            float input_pixel = input_images[idx3(batch_index, input_row, input_col,
+                                                   height, width)];
+            float kernel_weight = kernel[kernel_row * kernel_size + kernel_col];
+            accumulated_value += input_pixel * kernel_weight;
+        }
+    }
+
+    output_images[idx3(batch_index, row, col, height, width)] = accumulated_value;
+}
 
 void conv2d_variant1(const float* input, const float* kernel, float* output,
                      int batch_size, int height, int width, int kernel_size,
                      cudaStream_t stream) {
     // TODO: Configure and launch your kernel
 
-    // Your code here
+    dim3 threads_per_block(16, 16, 1);
+    dim3 blocks_per_grid(
+        (width + threads_per_block.x - 1) / threads_per_block.x,
+        (height + threads_per_block.y - 1) / threads_per_block.y,
+        batch_size
+    );
+
+    kernel_conv2d_variant_1<<<blocks_per_grid, threads_per_block, 0, stream>>>(
+        input, kernel, output, batch_size, height, width, kernel_size
+    );
 }
 
 // =============================================================================
