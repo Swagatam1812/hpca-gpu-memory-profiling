@@ -359,12 +359,105 @@ void conv2d_variant2(const float* input, const float* kernel, float* output,
 //
 // =============================================================================
 
+#define A 2
+#define B 2
 
+__global__ void conv2d_variant3_kernel(const float* __restrict__ input,
+                   float* __restrict__ output,
+                   int n, int h, int w, int k) {
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    int batch_index = blockIdx.z;
+
+    int radius = (k - 1) / 2;
+    extern __shared__ float sm[];
+
+    int tid = ty * TILE_WIDTH + tx;
+    int tw = TILE_WIDTH * B + 2 * radius;
+    int th = TILE_HEIGHT * A + 2 * radius;
+    int total = tw * th;
+    int tpb = TILE_WIDTH * TILE_HEIGHT;
+
+    for (int i = tid; i < total; i += tpb) {
+        int rr = i / tw;
+        int cc = i % tw;
+        int gr = blockIdx.y * (TILE_HEIGHT * A) - radius + rr;
+        int gc = blockIdx.x * (TILE_WIDTH  * B) - radius + cc;
+
+        float v = 0.0f;
+        if (gr >= 0 && gr < h && gc >= 0 && gc < w && batch_index < n) {
+            v = input[idx3(batch_index, gr, gc, h, w)];
+        }
+        sm[rr * tw + cc] = v;
+    }
+
+    __syncthreads();
+
+    float q[A][B];
+    #pragma unroll
+    for (int i = 0; i < A; i++) {
+        #pragma unroll
+        for (int j = 0; j < B; j++) {
+            q[i][j] = 0.0f;
+        }
+    }
+
+    for (int kr = 0; kr < k; kr++) {
+        for (int kc = 0; kc < k; kc++) {
+            float wv = const_kernel[kr * k + kc];
+            #pragma unroll
+            for (int i = 0; i < A; i++) {
+                #pragma unroll
+                for (int j = 0; j < B; j++) {
+                    int sr = ty * A + i + kr;
+                    int sc = tx * B + j + kc;
+                    q[i][j] += sm[sr * tw + sc] * wv;
+                }
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < A; i++) {
+        #pragma unroll
+        for (int j = 0; j < B; j++) {
+            int rr = blockIdx.y * (TILE_HEIGHT * A) + ty * A + i;
+            int cc = blockIdx.x * (TILE_WIDTH  * B) + tx * B + j;
+            if (batch_index < n && rr < h && cc < w) {
+                output[idx3(batch_index, rr, cc, h, w)] = q[i][j];
+            }
+        }
+    }
+}
+
+// void conv2d_variant3(const float* input, const float* kernel, float* output,
+//                      int batch_size, int height, int width, int kernel_size,
+//                      cudaStream_t stream) 
 void conv2d_variant3(const float* input, const float* kernel, float* output,
-                     int batch_size, int height, int width, int kernel_size,
-                     cudaStream_t stream) {
+        int batch_size, int height, int width, int kernel_size, cudaStream_t stream) {
+    if (kernel_size > MAX_KERNEL_SIZE) return;
 
-    // Your code here
+    cudaMemcpyToSymbol(const_kernel, kernel, kernel_size * kernel_size * sizeof(float));
+
+    int radius = (kernel_size - 1) / 2;
+
+    size_t sm_bytes =
+        (TILE_WIDTH * B + 2 * radius) *
+        (TILE_HEIGHT * A + 2 * radius) *
+        sizeof(float);
+
+    cudaDeviceProp p;
+    cudaGetDeviceProperties(&p, 0);
+    if (sm_bytes > p.sharedMemPerBlock) return;
+
+    dim3 th(TILE_WIDTH, TILE_HEIGHT);
+    dim3 bl(
+        (width + TILE_WIDTH  * B - 1) / (TILE_WIDTH  * B),
+        (height + TILE_HEIGHT * A - 1) / (TILE_HEIGHT * A),
+        batch_size
+    );
+
+    conv2d_variant3_kernel<<<bl, th, sm_bytes, stream>>>(input, output, batch_size, height, width, kernel_size);
 }
 
 // =============================================================================
