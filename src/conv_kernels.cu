@@ -178,12 +178,112 @@ void conv2d_variant1(const float* input, const float* kernel, float* output,
 //
 // =============================================================================
 
+// ================================================================
+// VARIANT 2 — Shared Memory + Constant Memory Kernel
+// (Matches TA style, simple cooperative load, same idx3 usage)
+// ================================================================
 
+#define TILE_WIDTH 16
+#define TILE_HEIGHT 16
+#define MAX_KERNEL_SIZE 31
+#define MAX_KERNEL_ELEMENTS (MAX_KERNEL_SIZE * MAX_KERNEL_SIZE)
+
+__constant__ float const_kernel[MAX_KERNEL_ELEMENTS];
+
+__global__ void kernel_conv2d_variant_2(const float* __restrict__ input_images,
+                                       float* __restrict__ output_images,
+                                       int batch_size, int height, int width,
+                                       int kernel_size) 
+{
+    int batch_index = blockIdx.z;
+
+    int radius = (kernel_size - 1) / 2;
+
+    // Compute input tile dimensions
+    int in_tile_w = TILE_WIDTH  + 2 * radius;
+    int in_tile_h = TILE_HEIGHT + 2 * radius;
+
+    extern __shared__ float shared_input[];
+
+    // Map threads to input tile loads
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    // global coords this thread loads (with halo offset)
+    int input_row = blockIdx.y * TILE_HEIGHT + ty - radius;
+    int input_col = blockIdx.x * TILE_WIDTH  + tx - radius;
+
+    float val = 0.0f;
+
+    if (batch_index < batch_size &&
+        input_row >= 0 && input_row < height &&
+        input_col >= 0 && input_col < width) 
+    {
+        val = input_images[idx3(batch_index, input_row, input_col, height, width)];
+    }
+
+    // Write to shared memory
+    shared_input[ty * in_tile_w + tx] = val;
+
+    __syncthreads();
+
+    // Now compute only if inside output region
+    int out_row = blockIdx.y * TILE_HEIGHT + ty;
+    int out_col = blockIdx.x * TILE_WIDTH  + tx;
+
+    if (batch_index >= batch_size ||
+        ty >= TILE_HEIGHT || tx >= TILE_WIDTH ||
+        out_row >= height || out_col >= width) 
+    {
+        return;
+    }
+
+    // The output pixel center in shared memory is shifted by +radius
+    int center_r = ty + radius;
+    int center_c = tx + radius;
+
+    float acc = 0.0f;
+
+    for (int kr = 0; kr < kernel_size; kr++) {
+        for (int kc = 0; kc < kernel_size; kc++) {
+            float pixel = shared_input[(center_r + kr - radius) * in_tile_w +
+                                       (center_c + kc - radius)];
+
+            float w = const_kernel[kr * kernel_size + kc];
+
+            acc += pixel * w;
+        }
+    }
+
+    output_images[idx3(batch_index, out_row, out_col, height, width)] = acc;
+}
+
+// Host launcher for variant2
 void conv2d_variant2(const float* input, const float* kernel, float* output,
-                     int batch_size, int height, int width, int kernel_size,
-                     cudaStream_t stream) {
+                     int batch_size, int height, int width,
+                     int kernel_size, cudaStream_t stream)
+{
+    if (kernel_size > MAX_KERNEL_SIZE) {
+        fprintf(stderr, "Kernel too large for constant memory.\n");
+        return;
+    }
 
-    // Your code here
+    size_t kernel_bytes = kernel_size * kernel_size * sizeof(float);
+    cudaMemcpyToSymbol(const_kernel, kernel, kernel_bytes);
+
+    int radius = (kernel_size - 1) / 2;
+    int in_tile_w = TILE_WIDTH  + 2 * radius;
+    int in_tile_h = TILE_HEIGHT + 2 * radius;
+
+    size_t shared_bytes = in_tile_w * in_tile_h * sizeof(float);
+
+    dim3 block_dim(in_tile_w, in_tile_h);
+    dim3 grid_dim((width + TILE_WIDTH  - 1) / TILE_WIDTH,
+                  (height + TILE_HEIGHT - 1) / TILE_HEIGHT,
+                  batch_size);
+
+    kernel_conv2d_variant_2<<<grid_dim, block_dim, shared_bytes, stream>>>(
+        input, output, batch_size, height, width, kernel_size);
 }
 
 // =============================================================================
