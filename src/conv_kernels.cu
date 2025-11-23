@@ -183,108 +183,151 @@ void conv2d_variant1(const float* input, const float* kernel, float* output,
 // (Matches TA style, simple cooperative load, same idx3 usage)
 // ================================================================
 
-#define TILE_WIDTH 16
-#define TILE_HEIGHT 16
+// Variant 2: shared-memory tiling + constant memory for kernel
+// Paste into src/conv_kernels.cu alongside idx3 and other kernels.
+
 #define MAX_KERNEL_SIZE 31
 #define MAX_KERNEL_ELEMENTS (MAX_KERNEL_SIZE * MAX_KERNEL_SIZE)
+#define TILE_WIDTH 16
+#define TILE_HEIGHT 16
 
+// Constant memory for kernel weights (read-only, cached)
 __constant__ float const_kernel[MAX_KERNEL_ELEMENTS];
 
-__global__ void kernel_conv2d_variant_2(const float* __restrict__ input_images,
+__global__ void kernel_conv2d_variant2(const float* __restrict__ input_images,
                                        float* __restrict__ output_images,
                                        int batch_size, int height, int width,
-                                       int kernel_size) 
-{
-    int batch_index = blockIdx.z;
+                                       int kernel_size) {
+    // dynamic shared memory array passed from kernel launch
+    extern __shared__ float scratchpad_input[]; // flattened 2D tile (row-major)
 
-    int radius = (kernel_size - 1) / 2;
+    const int radius = (kernel_size - 1) / 2;
+    const int input_tile_width = TILE_WIDTH + 2 * radius;
+    const int input_tile_height = TILE_HEIGHT + 2 * radius;
+    const int sstride = input_tile_width; // shared stride
 
-    // Compute input tile dimensions
-    int in_tile_w = TILE_WIDTH  + 2 * radius;
-    int in_tile_h = TILE_HEIGHT + 2 * radius;
+    const int tx = threadIdx.x; // 0 .. TILE_WIDTH-1
+    const int ty = threadIdx.y; // 0 .. TILE_HEIGHT-1
 
-    extern __shared__ float shared_input[];
+    const int batch_index = blockIdx.z;
 
-    // Map threads to input tile loads
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
+    // Coordinates of the output pixel this thread will compute
+    const int output_row = blockIdx.y * TILE_HEIGHT + ty;
+    const int output_col = blockIdx.x * TILE_WIDTH + tx;
 
-    // global coords this thread loads (with halo offset)
-    int input_row = blockIdx.y * TILE_HEIGHT + ty - radius;
-    int input_col = blockIdx.x * TILE_WIDTH  + tx - radius;
+    // Top-left of the input tile in global coordinates (includes halo)
+    const int input_tile_start_row = blockIdx.y * TILE_HEIGHT - radius;
+    const int input_tile_start_col = blockIdx.x * TILE_WIDTH - radius;
 
-    float val = 0.0f;
+    // Cooperative load of entire input tile (includes halo). We'll linearize tile indices.
+    const int block_threads = TILE_WIDTH * TILE_HEIGHT;          // e.g., 256
+    const int thread_id = ty * TILE_WIDTH + tx;                 // linear thread id in block
+    const int tile_pixels = input_tile_width * input_tile_height;
 
-    if (batch_index < batch_size &&
-        input_row >= 0 && input_row < height &&
-        input_col >= 0 && input_col < width) 
-    {
-        val = input_images[idx3(batch_index, input_row, input_col, height, width)];
+    // Loop: distribute tile_pixels across threads in the block.
+    for (int i = thread_id; i < tile_pixels; i += block_threads) {
+        const int tile_row = i / input_tile_width;               // 0..input_tile_height-1
+        const int tile_col = i % input_tile_width;               // 0..input_tile_width-1
+
+        const int global_row = input_tile_start_row + tile_row;
+        const int global_col = input_tile_start_col + tile_col;
+
+        float pixel_value = 0.0f;
+        if (batch_index < batch_size &&
+            global_row >= 0 && global_row < height &&
+            global_col >= 0 && global_col < width) {
+            pixel_value = input_images[idx3(batch_index, global_row, global_col, height, width)];
+        }
+
+        // store into shared memory
+        scratchpad_input[tile_row * sstride + tile_col] = pixel_value;
     }
 
-    // Write to shared memory
-    shared_input[ty * in_tile_w + tx] = val;
-
+    // All threads must wait for shared tile to be populated
     __syncthreads();
 
-    // Now compute only if inside output region
-    int out_row = blockIdx.y * TILE_HEIGHT + ty;
-    int out_col = blockIdx.x * TILE_WIDTH  + tx;
-
-    if (batch_index >= batch_size ||
-        ty >= TILE_HEIGHT || tx >= TILE_WIDTH ||
-        out_row >= height || out_col >= width) 
-    {
+    // Bounds: threads that compute outside image should not write, but must have participated in loads above.
+    if (batch_index >= batch_size || output_row >= height || output_col >= width) {
         return;
     }
 
-    // The output pixel center in shared memory is shifted by +radius
-    int center_r = ty + radius;
-    int center_c = tx + radius;
-
+    // Compute convolution using data from shared memory and kernel from constant memory
     float acc = 0.0f;
 
-    for (int kr = 0; kr < kernel_size; kr++) {
-        for (int kc = 0; kc < kernel_size; kc++) {
-            float pixel = shared_input[(center_r + kr - radius) * in_tile_w +
-                                       (center_c + kc - radius)];
+    // center position inside shared tile for (ty,tx) is (ty + radius, tx + radius)
+    const int center_row = ty + radius;
+    const int center_col = tx + radius;
 
-            float w = const_kernel[kr * kernel_size + kc];
-
-            acc += pixel * w;
+    // iterate kernel
+    for (int kr = 0; kr < kernel_size; ++kr) {
+        const int srow = center_row + (kr - radius); // alternative indexing below keeps it simple
+        // We'll compute scratch indices as (center_row + kr - radius) but since we loaded halo that maps to 0..input_tile_height-1
+        for (int kc = 0; kc < kernel_size; ++kc) {
+            const int scol = center_col + (kc - radius);
+            // access from shared memory (fast)
+            float inpix = scratchpad_input[srow * sstride + scol];
+            float kw = const_kernel[kr * kernel_size + kc];
+            acc += inpix * kw;
         }
     }
 
-    output_images[idx3(batch_index, out_row, out_col, height, width)] = acc;
+    // Write output (coalesced across threads in a warp because threadIdx.x maps to column)
+    output_images[idx3(batch_index, output_row, output_col, height, width)] = acc;
 }
 
-// Host launcher for variant2
+
+// Host wrapper: copy kernel into constant memory, compute shared memory size, and launch
 void conv2d_variant2(const float* input, const float* kernel, float* output,
-                     int batch_size, int height, int width,
-                     int kernel_size, cudaStream_t stream)
-{
+                     int batch_size, int height, int width, int kernel_size,
+                     cudaStream_t stream) {
     if (kernel_size > MAX_KERNEL_SIZE) {
-        fprintf(stderr, "Kernel too large for constant memory.\n");
+        fprintf(stderr, "Error: kernel_size %d exceeds MAX_KERNEL_SIZE %d\n",
+                kernel_size, MAX_KERNEL_SIZE);
         return;
     }
 
+    // copy kernel weights to constant memory
     size_t kernel_bytes = kernel_size * kernel_size * sizeof(float);
-    cudaMemcpyToSymbol(const_kernel, kernel, kernel_bytes);
+    cudaError_t err = cudaMemcpyToSymbol(const_kernel, kernel, kernel_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpyToSymbol failed: %s\n", cudaGetErrorString(err));
+        return;
+    }
 
-    int radius = (kernel_size - 1) / 2;
-    int in_tile_w = TILE_WIDTH  + 2 * radius;
-    int in_tile_h = TILE_HEIGHT + 2 * radius;
+    // compute shared memory size and check device limit
+    const int radius = (kernel_size - 1) / 2;
+    const int input_tile_width = TILE_WIDTH + 2 * radius;
+    const int input_tile_height = TILE_HEIGHT + 2 * radius;
+    size_t shared_mem_bytes = size_t(input_tile_width) * size_t(input_tile_height) * sizeof(float);
 
-    size_t shared_bytes = in_tile_w * in_tile_h * sizeof(float);
+    int dev = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceProp props;
+    cudaGetDeviceProperties(&props, dev);
+    if (shared_mem_bytes > props.sharedMemPerBlock) {
+        fprintf(stderr, "Error: Required shared memory (%zu bytes) exceeds device limit (%zu bytes)\n",
+                shared_mem_bytes, (size_t)props.sharedMemPerBlock);
+        return;
+    }
 
-    dim3 block_dim(in_tile_w, in_tile_h);
-    dim3 grid_dim((width + TILE_WIDTH  - 1) / TILE_WIDTH,
-                  (height + TILE_HEIGHT - 1) / TILE_HEIGHT,
-                  batch_size);
+    dim3 threads_per_block(TILE_WIDTH, TILE_HEIGHT, 1);
+    dim3 blocks_per_grid(
+        (width  + TILE_WIDTH  - 1) / TILE_WIDTH,
+        (height + TILE_HEIGHT - 1) / TILE_HEIGHT,
+        batch_size
+    );
 
-    kernel_conv2d_variant_2<<<grid_dim, block_dim, shared_bytes, stream>>>(
-        input, output, batch_size, height, width, kernel_size);
+    kernel_conv2d_variant2<<<blocks_per_grid, threads_per_block, shared_mem_bytes, stream>>>(
+        input, output, batch_size, height, width, kernel_size
+    );
+
+    // check launch
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "Kernel launch failed: %s\n", cudaGetErrorString(err));
+    }
 }
+
 
 // =============================================================================
 // VARIANT 3: REGISTER-LEVEL OPTIMIZATION AND DATA LOCALITY
